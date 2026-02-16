@@ -1,0 +1,206 @@
+#!/bin/bash
+# /var/ossec/active-response/bin/forensic-trigger.sh
+# Ubuntu 전용 / pcap 미사용 / Wazuh active-response(Agent)에서 휘발성 정보 수집용
+
+set -euo pipefail
+umask 077
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+
+ACTION="${1:-unknown}"     # add
+RULE_ID="${2:-unknown}"    # 100110
+TRIGGER_USER="${3:-unknown}"
+SRC_IP="${4:-unknown}"
+
+TS="$(date +%Y%m%d_%H%M%S)"
+HOST="$(hostname -f 2>/dev/null || hostname)"
+INCIDENT_ID="ir_${RULE_ID}_${HOST}_${TS}"
+BASE_DIR="/var/ossec/logs/forensics"
+WORK_DIR="$(mktemp -d "${BASE_DIR}/${INCIDENT_ID}.XXXX")"
+OUT_DIR="${WORK_DIR}/${INCIDENT_ID}"
+
+LOG_AR="/var/ossec/logs/active-responses.log"
+mkdir -p "$BASE_DIR" "$OUT_DIR"
+
+cleanup() {
+  # WORK_DIR는 압축 후 정리
+  rm -rf "$WORK_DIR" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+log() {
+  echo "[$(date -Is)] $*" >> "$LOG_AR"
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# timeout 안전 실행 (명령이 없거나 실패해도 계속 진행)
+run() {
+  local name="$1"; shift
+  local file="${OUT_DIR}/${name}.txt"
+  {
+    echo "### ${name}"
+    echo "### date: $(date -Is)"
+    echo "### cmd : $*"
+    echo
+    if have timeout; then
+      timeout 12s bash -lc "$*" 2>&1 || true
+    else
+      bash -lc "$*" 2>&1 || true
+    fi
+  } > "$file"
+}
+
+# ─────────────────────────────────────────────
+# 0) 메타 + (가능하면) alert 원문 저장(표준입력)
+# ─────────────────────────────────────────────
+{
+  echo "incident_id=${INCIDENT_ID}"
+  echo "timestamp=$(date -Is)"
+  echo "host=${HOST}"
+  echo "action=${ACTION}"
+  echo "rule_id=${RULE_ID}"
+  echo "trigger_user=${TRIGGER_USER}"
+  echo "source_ip=${SRC_IP}"
+  echo "script=$(readlink -f "$0" 2>/dev/null || echo "$0")"
+  echo "uid=$(id -u) user=$(id -un 2>/dev/null || true)"
+} > "${OUT_DIR}/metadata.txt"
+
+# Wazuh active-response는 종종 alert JSON을 stdin으로 넣어줌(환경 따라 다름)
+# stdin이 비어있어도 block 안 걸리게 짧게만 읽음
+if have timeout; then
+  timeout 1s cat > "${OUT_DIR}/alert.json" 2>/dev/null || true
+else
+  cat > "${OUT_DIR}/alert.json" 2>/dev/null || true
+fi
+# 비어있으면 제거
+if [ ! -s "${OUT_DIR}/alert.json" ]; then
+  rm -f "${OUT_DIR}/alert.json"
+fi
+
+# ─────────────────────────────────────────────
+# 1) 시스템/호스트 정보
+# ─────────────────────────────────────────────
+run "system_uname" "uname -a"
+run "system_release" "cat /etc/os-release; echo; lsb_release -a 2>/dev/null || true"
+run "system_uptime" "uptime; who -b 2>/dev/null || true"
+run "system_time" "date -Is; timedatectl 2>/dev/null || true"
+
+# ─────────────────────────────────────────────
+# 2) 네트워크 스냅샷
+# ─────────────────────────────────────────────
+run "net_ip" "ip -br a; echo; ip r; echo; ip neigh 2>/dev/null || true"
+run "net_dns" "cat /etc/resolv.conf 2>/dev/null || true; echo; cat /etc/hosts 2>/dev/null || true"
+run "net_ss_tcp" "ss -antp"
+run "net_ss_udp" "ss -uanp"
+if have lsof; then
+  run "net_lsof" "lsof -nP -i"
+fi
+
+# ─────────────────────────────────────────────
+# 3) 프로세스 스냅샷
+# ─────────────────────────────────────────────
+run "proc_ps_aux" "ps auxwwf"
+run "proc_ps_tree" "pstree -p -a 2>/dev/null || true"
+run "proc_top_like" "ps -eo pid,ppid,user,lstart,etime,cmd --sort=-etime | head -n 200"
+
+# ─────────────────────────────────────────────
+# 4) 의심 PID 후보 수집 + /proc 
+#    - alert.json이 있으면 그 안의 pid를 우선( jq 있으면 파싱 )
+#    - 없으면 흔한 리버스쉘 패턴으로 pgrep(보조)
+# ─────────────────────────────────────────────
+SUS_PIDS=()
+
+if [ -s "${OUT_DIR}/alert.json" ] && have jq; then
+  # 다양한 필드명을 대충 커버(환경마다 다를 수 있어서 여러 경로 시도)
+  mapfile -t PIDS_FROM_ALERT < <(jq -r '
+      .. | objects |
+      (.pid? // .process?.pid? // .data?.pid? // empty)
+    ' "${OUT_DIR}/alert.json" 2>/dev/null | grep -E '^[0-9]+$' | sort -u)
+  if [ "${#PIDS_FROM_ALERT[@]}" -gt 0 ]; then
+    SUS_PIDS+=("${PIDS_FROM_ALERT[@]}")
+  fi
+fi
+
+# 보조: 흔한 패턴 (오탐/누락 가능하니 참고용)
+mapfile -t PIDS_FROM_PGREP < <(pgrep -f "bash -i|nc .* -e|ncat .* -e|socat .* exec|python.*pty|perl .*socket" 2>/dev/null | sort -u || true)
+if [ "${#PIDS_FROM_PGREP[@]}" -gt 0 ]; then
+  SUS_PIDS+=("${PIDS_FROM_PGREP[@]}")
+fi
+
+# 중복 제거
+if [ "${#SUS_PIDS[@]}" -gt 0 ]; then
+  mapfile -t SUS_PIDS < <(printf "%s\n" "${SUS_PIDS[@]}" | grep -E '^[0-9]+$' | sort -u)
+fi
+
+for pid in "${SUS_PIDS[@]:-}"; do
+  [ -d "/proc/$pid" ] || continue
+  {
+    echo "### pid=${pid}"
+    echo "time=$(date -Is)"
+    echo "cmdline=$(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null || true)"
+    echo "exe=$(readlink /proc/$pid/exe 2>/dev/null || true)"
+    echo "cwd=$(readlink /proc/$pid/cwd 2>/dev/null || true)"
+    echo
+    echo "== /proc/$pid/status =="
+    cat "/proc/$pid/status" 2>/dev/null || true
+    echo
+    echo "== environ (주의: 민감정보 포함 가능) =="
+    tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null || true
+    echo
+    echo "== fd list =="
+    ls -la "/proc/$pid/fd" 2>/dev/null || true
+    echo
+    if have lsof; then
+      echo "== lsof -p $pid =="
+      lsof -nP -p "$pid" 2>/dev/null || true
+      echo
+      echo "== lsof -p $pid -i =="
+      lsof -nP -p "$pid" -i 2>/dev/null || true
+    fi
+  } > "${OUT_DIR}/suspect_pid_${pid}.txt" 2>&1 || true
+done
+
+# ─────────────────────────────────────────────
+# 5) 사용자/로그온 흔적
+# ─────────────────────────────────────────────
+run "users_w" "w"
+run "users_who" "who -a"
+run "users_last" "last -n 50"
+
+# ─────────────────────────────────────────────
+# 6) 로그 스냅샷 (Ubuntu 기준)--> 로그 스냅샷 부분은 주석처리되었음!!!!!
+# ─────────────────────────────────────────────
+#run "log_auth" "tail -n 2000 /var/log/auth.log 2>/dev/null || true"
+#run "log_syslog" "tail -n 2000 /var/log/syslog 2>/dev/null || true"
+#run "log_kern" "tail -n 2000 /var/log/kern.log 2>/dev/null || true"
+#run "log_journal_30m" "journalctl --since '30 minutes ago' --no-pager 2>/dev/nul
+#l | tail -n 4000 || true"
+
+# Falco (있을 때만)
+#run "log_falco" "tail -n 1000 /var/log/falco/falco.log 2>/dev/null || true"
+
+# ─────────────────────────────────────────────
+# 7) bash history (있을 때만, 실패해도 진행)
+# ─────────────────────────────────────────────
+mkdir -p "${OUT_DIR}/history"
+cp -a /root/.bash_history "${OUT_DIR}/history/root.bash_history" 2>/dev/null || true
+for f in /home/*/.bash_history; do
+  [ -f "$f" ] || continue
+  u="$(basename "$(dirname "$f")")"
+  cp -a "$f" "${OUT_DIR}/history/${u}.bash_history" 2>/dev/null || true
+done
+
+# ─────────────────────────────────────────────
+# 8) 패키징 + 해시
+# ─────────────────────────────────────────────
+ARCHIVE="${BASE_DIR}/${INCIDENT_ID}.tar.gz"
+(
+  cd "$WORK_DIR"
+  tar -czf "$ARCHIVE" "$(basename "$OUT_DIR")"
+)
+sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
+
+log "Forensic snapshot completed: incident=${INCIDENT_ID} archive=${ARCHIVE}"
+
+exit 0
+
