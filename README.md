@@ -1,5 +1,6 @@
 # shellscript-for-Volatile-Data-Collection
 Linux Volatile Data Collection. 리눅스 휘발성 정보 수집 쉘코드입니다.
+
 특정 rule.level에 도달했을 경우 자동으로 Agent에서 Wazuh-Active-Response가 실행됩니다. *local.rules 수정 필요
 수집되는 범위는 다음과 같습니다.
 
