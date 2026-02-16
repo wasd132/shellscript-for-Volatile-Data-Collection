@@ -2,6 +2,7 @@
 Linux Volatile Data Collection. 리눅스 휘발성 정보 수집 쉘코드입니다.
 Wazuh-Active-Response에서 사용했으며, rule.level에 도달했을 경우 자동으로 실행됩니다.
 수집되는 범위는 다음과 같습니다.
+
 ----
 **1. 시스템 정보**
 - `uname -a` - 커널 및 시스템 정보
